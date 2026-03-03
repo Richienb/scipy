@@ -24,7 +24,9 @@ from typing import cast, get_args, Literal
 
 import numpy as np
 import pytest
-from scipy._lib._array_api import xp_assert_close, xp_assert_equal
+from scipy._lib._array_api import (
+    xp_assert_close, xp_assert_equal, make_xp_test_case
+)
 from scipy.fft import fftshift
 from scipy.stats import norm as normal_distribution  # type: ignore
 from scipy.signal import check_COLA, get_window, welch, stft, istft, spectrogram
@@ -1114,3 +1116,99 @@ def test_energy_conservation(N_x: int, w_size: int, t_step: int, f_c: float):
 
 def test_subscriptable_generic_type():
     assert isinstance(ShortTimeFFT[np.float64], GenericAlias)
+
+
+# #############################################################################
+# Array API tests
+# #############################################################################
+
+@make_xp_test_case(ShortTimeFFT)
+class TestShortTimeFFTArrayAPI:
+    """Tests for Array API support in ShortTimeFFT.
+
+    These tests verify that ShortTimeFFT and closest_STFT_dual_window
+    work correctly with different Array API backends.
+    """
+
+    @pytest.mark.parametrize("fft_mode", ["onesided", "twosided", "centered"])
+    def test_stft_roundtrip(self, xp, fft_mode):
+        """Test that stft -> istft roundtrip works with Array API arrays."""
+        win_np = gaussian(51, std=10, sym=True)
+        win = xp.asarray(win_np)
+        SFT = ShortTimeFFT(win, hop=10, fs=1.0, fft_mode=fft_mode)
+
+        N = 100
+        x_np = np.random.default_rng(0).standard_normal(N)
+        x = xp.asarray(x_np)
+
+        S = SFT.stft(x)
+        x_rec = SFT.istft(S, k1=N)
+        xp_assert_close(x_rec, x, atol=1e-10)
+
+    @pytest.mark.parametrize("padding", ["zeros", "edge", "even", "odd"])
+    def test_stft_padding(self, xp, padding):
+        """Test that stft works with all padding modes."""
+        win_np = gaussian(51, std=10, sym=True)
+        win = xp.asarray(win_np)
+        SFT = ShortTimeFFT(win, hop=10, fs=1.0)
+
+        N = 100
+        x_np = np.random.default_rng(0).standard_normal(N)
+        x = xp.asarray(x_np)
+
+        # Compare with NumPy reference
+        S_ref = ShortTimeFFT(win_np, hop=10, fs=1.0).stft(x_np, padding=padding)
+        S = SFT.stft(x, padding=padding)
+        xp_assert_close(S, xp.asarray(S_ref), atol=1e-12)
+
+    def test_stft_multidim(self, xp):
+        """Test stft with multi-dimensional input."""
+        win_np = gaussian(51, std=10, sym=True)
+        win = xp.asarray(win_np)
+        SFT = ShortTimeFFT(win, hop=10, fs=1.0)
+
+        N = 100
+        x_np = np.random.default_rng(0).standard_normal((3, N))
+        x = xp.asarray(x_np)
+
+        S = SFT.stft(x, axis=-1)
+        assert S.shape == (3, SFT.f_pts, SFT.p_num(N))
+        x_rec = SFT.istft(S, k1=N)
+        xp_assert_close(x_rec, x, atol=1e-10)
+
+    def test_spectrogram(self, xp):
+        """Test spectrogram returns non-negative real values."""
+        win_np = gaussian(51, std=10, sym=True)
+        win = xp.asarray(win_np)
+        SFT = ShortTimeFFT(win, hop=10, fs=1.0)
+
+        N = 100
+        x_np = np.random.default_rng(0).standard_normal(N)
+        x = xp.asarray(x_np)
+
+        Sx2 = SFT.spectrogram(x)
+        # Spectrogram should be real and non-negative
+        assert xp.all(Sx2 >= 0)
+
+    def test_freq_and_time_arrays(self, xp):
+        """Test that f and t properties return arrays in the right namespace."""
+        win_np = gaussian(51, std=10, sym=True)
+        win = xp.asarray(win_np)
+        SFT = ShortTimeFFT(win, hop=10, fs=1.0)
+
+        f = SFT.f
+        t = SFT.t(100)
+        assert f.shape == (SFT.f_pts,)
+        assert t.shape == (SFT.p_num(100),)
+
+
+@make_xp_test_case(closest_STFT_dual_window)
+def test_closest_STFT_dual_window_array_api(xp):
+    """Test closest_STFT_dual_window with Array API arrays."""
+    win_np = gaussian(51, std=10, sym=True)
+    win = xp.asarray(win_np)
+
+    d_win, alpha = closest_STFT_dual_window(win, hop=10)
+    xp_assert_close(d_win, xp.asarray(
+        closest_STFT_dual_window(win_np, hop=10)[0]
+    ), atol=1e-12)
