@@ -380,6 +380,8 @@ capabilities_overrides = {
     "stft": xp_capabilities(out_of_scope=True),  # legacy
     "istft": xp_capabilities(out_of_scope=True),  # legacy
     "check_COLA": xp_capabilities(out_of_scope=True),  # legacy
+    "ShortTimeFFT": xp_capabilities(jax_jit=False, allow_dask_compute=True),
+    "closest_STFT_dual_window": xp_capabilities(jax_jit=False, allow_dask_compute=True),
 }
 
 

@@ -16,6 +16,7 @@
 # Linter does not allow to import ``Generator`` from ``typing`` module:
 from collections.abc import Generator, Callable
 from functools import partial, cached_property
+import math
 from types import GenericAlias
 from typing import get_args, Literal
 
@@ -24,6 +25,8 @@ import numpy as np
 import scipy.fft as fft_lib
 from scipy.signal._signaltools import detrend
 from scipy.signal.windows import get_window
+from scipy._lib._array_api import array_namespace, is_numpy, xp_copy
+import scipy._external.array_api_extra as xpx
 
 __all__ = ['closest_STFT_dual_window', 'ShortTimeFFT']
 
@@ -44,10 +47,11 @@ def _calc_dual_canonical_window(win: np.ndarray, hop: int) -> np.ndarray:
     This is a separate function not a method, since it is also used in the
     class method ``ShortTimeFFT.from_dual()``.
     """
+    xp = array_namespace(win)
     if hop > len(win):
         raise ValueError(f"{hop=} is larger than window length of {len(win)}" +
                          " => STFT not invertible!")
-    if issubclass(win.dtype.type, np.integer):
+    if xp.isdtype(win.dtype, 'integral'):
         raise ValueError("Parameter 'win' cannot be of integer type, but " +
                          f"{win.dtype=} => STFT not invertible!")
         # The calculation of `relative_resolution` does not work for ints.
@@ -56,14 +60,14 @@ def _calc_dual_canonical_window(win: np.ndarray, hop: int) -> np.ndarray:
         # floats.
 
     w2 = win.real**2 + win.imag**2  # win*win.conj() does not ensure w2 is real
-    DD = w2.copy()
+    DD = xp_copy(w2, xp=xp)
     for k_ in range(hop, len(win), hop):
-        DD[k_:] += w2[:-k_]
-        DD[:-k_] += w2[k_:]
+        DD = xpx.at(DD, slice(k_, None)).add(w2[:-k_])
+        DD = xpx.at(DD, slice(None, -k_)).add(w2[k_:])
 
     # check DD > 0:
-    relative_resolution = np.finfo(win.dtype).resolution * max(DD)
-    if not np.all(DD >= relative_resolution):
+    relative_resolution = xp.finfo(win.dtype).resolution * xp.max(DD)
+    if not bool(xp.all(DD >= relative_resolution)):
         raise ValueError("Short-time Fourier Transform not invertible!")
 
     return win / DD
@@ -187,14 +191,15 @@ def closest_STFT_dual_window(win: np.ndarray, hop: int,
                                            dual are equal.
 
     """
+    xp = array_namespace(win)
     if desired_dual is None:  # default is rectangular window
-        desired_dual = np.ones_like(win)
+        desired_dual = xp.ones(win.shape, dtype=win.dtype)
     if not (win.ndim == 1 and win.shape == desired_dual.shape):
         raise ValueError("Parameters `win` and `desired_dual` are not 1d arrays of " +
                          f"equal length ({win.shape=}, {desired_dual.shape=})!")
-    if not all(np.isfinite(win)):
+    if not bool(xp.all(xp.isfinite(win))):
         raise ValueError("Parameter win must have finite entries!")
-    if not all(np.isfinite(desired_dual)):
+    if not bool(xp.all(xp.isfinite(desired_dual))):
         raise ValueError("Parameter desired_dual must have finite entries!")
     if not (1 <= hop <= len(win) and isinstance(hop, int | np.integer)):
         raise ValueError(f"Parameter {hop=} is not an integer between 1 and " +
@@ -202,10 +207,10 @@ def closest_STFT_dual_window(win: np.ndarray, hop: int,
 
     w_d = _calc_dual_canonical_window(win, hop)
     wdd = win.conjugate() * desired_dual
-    q_d = wdd.copy()
+    q_d = xp_copy(wdd, xp=xp)
     for k_ in range(hop, len(win), hop):
-        q_d[k_:] += wdd[:-k_]
-        q_d[:-k_] += wdd[k_:]
+        q_d = xpx.at(q_d, slice(k_, None)).add(wdd[:-k_])
+        q_d = xpx.at(q_d, slice(None, -k_)).add(wdd[k_:])
     q_d = w_d * q_d
 
     if not scaled:
@@ -213,12 +218,44 @@ def closest_STFT_dual_window(win: np.ndarray, hop: int,
 
     numerator = q_d.conjugate().T @ w_d
     denominator = q_d.T.real @ q_d.real + q_d.T.imag @ q_d.imag  # always >= 0
-    if not (abs(numerator) > 0 and denominator > np.finfo(w_d.dtype).resolution):
+    if not (abs(numerator) > 0 and denominator > xp.finfo(w_d.dtype).resolution):
         raise ValueError(
             "Unable to calculate scaled closest dual window due to numerically " +
             "unstable scaling factor! Try setting parameter `scaled` to False.")
     alpha = numerator / denominator
     return w_d + alpha * (desired_dual - q_d), alpha
+
+
+def _pad_slice(x, left_pad: int, right_pad: int, mode: str, xp):
+    """Pad the last axis of `x` by `left_pad` and `right_pad` samples.
+
+    This is a helper for `ShortTimeFFT._x_slices` that implements Array API
+    compatible padding for the four modes: 'zeros', 'edge', 'even', 'odd'.
+    """
+    if left_pad == 0 and right_pad == 0:
+        return x
+    if mode == 'zeros':
+        pad_width = [(0, 0)] * (x.ndim - 1) + [(left_pad, right_pad)]
+        return xpx.pad(x, pad_width, mode='constant', constant_values=0, xp=xp)
+    parts = []
+    if left_pad > 0:
+        if mode == 'edge':
+            left_part = xp.repeat(x[..., :1], left_pad, axis=-1)
+        elif mode == 'even':
+            left_part = xp.flip(x[..., 1:left_pad + 1], axis=-1)
+        else:  # 'odd'
+            left_part = 2 * x[..., :1] - xp.flip(x[..., 1:left_pad + 1], axis=-1)
+        parts.append(left_part)
+    parts.append(x)
+    if right_pad > 0:
+        if mode == 'edge':
+            right_part = xp.repeat(x[..., -1:], right_pad, axis=-1)
+        elif mode == 'even':
+            right_part = xp.flip(x[..., -right_pad - 1:-1], axis=-1)
+        else:  # 'odd'
+            right_part = 2 * x[..., -1:] - xp.flip(x[..., -right_pad - 1:-1], axis=-1)
+        parts.append(right_part)
+    return xp.concat(parts, axis=-1)
 
 
 # noinspection PyShadowingNames
@@ -434,23 +471,26 @@ class ShortTimeFFT:
                  dual_win: np.ndarray | None = None,
                  scale_to: Literal['magnitude', 'psd'] | None = None,
                  phase_shift: int | None = 0):
+        xp = array_namespace(win)
         if not (win.ndim == 1 and win.size > 0):
             raise ValueError(f"Parameter win must be 1d, but {win.shape=}!")
-        if not all(np.isfinite(win)):
+        if not bool(xp.all(xp.isfinite(win))):
             raise ValueError("Parameter win must have finite entries!")
         if not (hop >= 1 and isinstance(hop, int | np.integer)):
             raise ValueError(f"Parameter {hop=} is not an integer >= 1!")
 
         self._win, self._hop, self.fs = win, hop, fs
-        self.win.setflags(write=False)
+        if is_numpy(xp):
+            self.win.setflags(write=False)
         self.mfft = len(win) if mfft is None else mfft
 
         if dual_win is not None:
             if dual_win.shape != win.shape:
                 raise ValueError(f"{dual_win.shape=} must equal {win.shape=}!")
-            if not all(np.isfinite(dual_win)):
+            if not bool(xp.all(xp.isfinite(dual_win))):
                 raise ValueError("Parameter dual_win must be a finite array!")
-            dual_win.setflags(write=False)
+            if is_numpy(xp):
+                dual_win.setflags(write=False)
         self._dual_win = dual_win  # needs to be set before scaling
 
         if scale_to is not None:  # needs to be set before fft_mode
@@ -750,13 +790,14 @@ class ShortTimeFFT:
         ``SFT.win`` is scaled by ``1/np.sqrt(SFT.mfft)``. Hence, ``SFT.win`` needs to
         be scaled by `s_fac` in the plot above.
         """
+        xp = array_namespace(desired_win)
         if not (desired_win.ndim == 1 and desired_win.size > 0):
             raise ValueError(f"Parameter desired_win is not 1d, but "
                              f"{desired_win.shape=}!")
-        if issubclass(desired_win.dtype.type, np.integer):
+        if xp.isdtype(desired_win.dtype, 'integral'):
             raise ValueError("Parameter desired_win cannot be of integer type, " +
                              f"but {desired_win.dtype=} => cast to float | complex ")
-        if not all(np.isfinite(desired_win)):
+        if not bool(xp.all(xp.isfinite(desired_win))):
             raise ValueError("Parameter desired_win must have finite entries!")
         if not (1 <= hop <= len(desired_win) and isinstance(hop, int | np.integer)):
             raise ValueError(f"Parameter {hop=} is not an integer between 1 and " +
@@ -766,16 +807,16 @@ class ShortTimeFFT:
                              "['magnitude', 'psd', 'unitary', None]!")
 
         mfft = len(desired_win) if mfft is None else mfft
-        s_fac = np.sqrt(mfft) if scale_to == 'unitary' else 1
+        s_fac = xp.sqrt(xp.asarray(mfft, dtype=desired_win.dtype)) if scale_to == 'unitary' else 1
 
-        win = desired_win.copy()  # we do not want to modify input parameters
-        relative_resolution = np.finfo(win.dtype).resolution * max(win)
+        win = xp_copy(desired_win, xp=xp)  # we do not want to modify input parameters
+        relative_resolution = xp.finfo(win.dtype).resolution * float(xp.max(win))
         for m in range(hop):
-            a = np.linalg.norm(desired_win[m::hop])
-            if not (a > relative_resolution):
+            a = xp.linalg.vector_norm(desired_win[m::hop])
+            if not bool(a > relative_resolution):
                 raise ValueError("Parameter desired_win does not have valid STFT dual "
                                  f"window for {hop=}!")
-            win[m::hop] /= a
+            win = xpx.at(win, slice(m, None, hop)).set(win[m::hop] / a)
 
         SFT = cls(win=win/s_fac, hop=hop, fs=fs, fft_mode=fft_mode, mfft=mfft,
                   dual_win=win*s_fac, phase_shift=phase_shift,
@@ -928,7 +969,8 @@ class ShortTimeFFT:
         if t not in (fft_mode_types := get_args(FFT_MODE_TYPE)):
             raise ValueError(f"fft_mode='{t}' not in {fft_mode_types}!")
 
-        if t in {'onesided', 'onesided2X'} and np.iscomplexobj(self.win):
+        xp = array_namespace(self._win)
+        if t in {'onesided', 'onesided2X'} and xp.isdtype(self.win.dtype, 'complex floating'):
             raise ValueError(f"One-sided spectra, i.e., fft_mode='{t}', " +
                              "are not allowed for complex-valued windows!")
 
@@ -1024,12 +1066,15 @@ class ShortTimeFFT:
         if self._scaling == scaling:  # do nothing
             return
 
+        xp = array_namespace(self._win)
         s_fac = self.fac_psd if scaling == 'psd' else self.fac_magnitude
         self._win = self._win * s_fac
-        self.win.setflags(write=False)
+        if is_numpy(xp):
+            self.win.setflags(write=False)
         if self._dual_win is not None:
             self._dual_win = self._dual_win / s_fac
-            self.dual_win.setflags(write=False)
+            if is_numpy(xp):
+                self.dual_win.setflags(write=False)
         self._fac_mag, self._fac_psd = None, None  # reset scaling factors
         self._scaling = scaling
 
@@ -1086,22 +1131,16 @@ class ShortTimeFFT:
         """
         if padding not in (padding_types := get_args(PAD_TYPE)):
             raise ValueError(f"Parameter {padding=} not in {padding_types}!")
-        pad_kws: dict[str, dict] = {  # possible keywords to pass to np.pad:
-            'zeros': dict(mode='constant', constant_values=(0, 0)),
-            'edge': dict(mode='edge'),
-            'even': dict(mode='reflect', reflect_type='even'),
-            'odd': dict(mode='reflect', reflect_type='odd'),
-           }  # typing of pad_kws is needed to make mypy happy
 
+        xp = array_namespace(x)
         n, n1 = x.shape[-1], (p1 - p0) * self.hop
         k0 = p0 * self.hop - self.m_num_mid + k_off  # start sample
         k1 = k0 + n1 + self.m_num  # end sample
 
         i0, i1 = max(k0, 0), min(k1, n)  # indexes to shorten x
-        # dimensions for padding x:
-        pad_width = [(0, 0)] * (x.ndim-1) + [(-min(k0, 0), max(k1 - n, 0))]
+        left_pad, right_pad = -min(k0, 0), max(k1 - n, 0)
 
-        x1 = np.pad(x[..., i0:i1], pad_width, **pad_kws[padding])
+        x1 = _pad_slice(x[..., i0:i1], left_pad, right_pad, padding, xp)
         for k_ in range(0, n1, self.hop):
             yield x1[..., k_:k_ + self.m_num]
 
@@ -1225,7 +1264,8 @@ class ShortTimeFFT:
                                    (without detrending).
         :class:`scipy.signal.ShortTimeFFT`: Class this method belongs to.
         """
-        if self.onesided_fft and np.iscomplexobj(x):
+        xp = array_namespace(x)
+        if self.onesided_fft and xp.isdtype(x.dtype, 'complex floating'):
             raise ValueError(f"Complex-valued `x` not allowed for {self.fft_mode=}'! "
                              "Set property `fft_mode` to 'twosided' or 'centered'.")
         if isinstance(detr, str):
@@ -1239,18 +1279,18 @@ class ShortTimeFFT:
             raise ValueError(f"{e_str} must be >= ceil(m_num/2) = {m2p}!")
 
         if x.ndim > 1:  # motivated by the NumPy broadcasting mechanisms:
-            x = np.moveaxis(x, axis, -1)
+            x = xp.moveaxis(x, axis, -1)
         # determine slice index range:
         p0, p1 = self.p_range(n, p0, p1)
         S_shape_1d = (self.f_pts, p1 - p0)
         S_shape = x.shape[:-1] + S_shape_1d if x.ndim > 1 else S_shape_1d
-        S = np.zeros(S_shape, dtype=complex)
+        S = xp.zeros(S_shape, dtype=xp.complex128)
         for p_, x_ in enumerate(self._x_slices(x, k_offset, p0, p1, padding)):
             if detr is not None:
                 x_ = detr(x_)
-            S[..., :, p_] = self._fft_func(x_ * self.win.conj())
+            S = xpx.at(S, (..., slice(None), p_)).set(self._fft_func(x_ * self.win.conj()))
         if x.ndim > 1:
-            return np.moveaxis(S, -2, axis if axis >= 0 else axis-1)
+            return xp.moveaxis(S, -2, axis if axis >= 0 else axis-1)
         return S
 
     def spectrogram(self, x: np.ndarray, y: np.ndarray | None = None,
@@ -1427,7 +1467,8 @@ class ShortTimeFFT:
         """
         if self._dual_win is None:
             self._dual_win = _calc_dual_canonical_window(self.win, self.hop)
-            self.dual_win.setflags(write=False)
+            if is_numpy(array_namespace(self._dual_win)):
+                self.dual_win.setflags(write=False)
         return self._dual_win
 
     @property
@@ -1507,10 +1548,11 @@ class ShortTimeFFT:
         if not (S.shape[t_axis] >= (q_num := self.p_num(n_min))):
             raise ValueError(f"{S.shape[t_axis]=} needs to have at least " +
                              f"{q_num} slices ({S.shape=})!")
+        xp = array_namespace(S)
         if t_axis != S.ndim - 1 or f_axis != S.ndim - 2:
             t_axis = S.ndim + t_axis if t_axis < 0 else t_axis
             f_axis = S.ndim + f_axis if f_axis < 0 else f_axis
-            S = np.moveaxis(S, (f_axis, t_axis), (-2, -1))
+            S = xp.moveaxis(S, (f_axis, t_axis), (-2, -1))
 
         q_max = S.shape[-1] + self.p_min
         k_max = (q_max - 1) * self.hop + self.m_num - self.m_num_mid
@@ -1528,8 +1570,8 @@ class ShortTimeFFT:
         q1 = min(self.p_max(k1), q_max)
         k_q0, k_q1 = self.nearest_k_p(k0), self.nearest_k_p(k1, left=False)
         n_pts = k_q1 - k_q0 + self.m_num - self.m_num_mid
-        x = np.zeros(S.shape[:-2] + (n_pts,),
-                     dtype=float if self.onesided_fft else complex)
+        out_dtype = xp.float64 if self.onesided_fft else xp.complex128
+        x = xp.zeros(S.shape[:-2] + (n_pts,), dtype=out_dtype)
         for q_ in range(q0, q1):
             xs = self._ifft_func(S[..., :, q_ - self.p_min]) * self.dual_win
             i0 = q_ * self.hop - self.m_num_mid
@@ -1538,10 +1580,10 @@ class ShortTimeFFT:
             if i0 < k0:  # xs sticks out to the left on x:
                 j0 += k0 - i0
                 i0 = k0
-            x[..., i0-k0:i1-k0] += xs[..., j0:j1]
+            x = xpx.at(x, (..., slice(i0-k0, i1-k0))).add(xs[..., j0:j1])
         x = x[..., :k1-k0]
         if x.ndim > 1:
-            x = np.moveaxis(x, -1, f_axis if f_axis < x.ndim else t_axis)
+            x = xp.moveaxis(x, -1, f_axis if f_axis < x.ndim else t_axis)
         return x
 
     @property
@@ -1563,7 +1605,8 @@ class ShortTimeFFT:
         if self.scaling == 'magnitude':
             return 1
         if self._fac_mag is None:
-            self._fac_mag = 1 / abs(sum(self.win))
+            xp = array_namespace(self._win)
+            self._fac_mag = 1 / abs(float(xp.sum(self.win)))
         return self._fac_mag
 
     @property
@@ -1585,8 +1628,9 @@ class ShortTimeFFT:
         if self.scaling == 'psd':
             return 1
         if self._fac_psd is None:
-            self._fac_psd = 1 / np.sqrt(
-                sum(self.win.real**2+self.win.imag**2) / self.T)
+            xp = array_namespace(self._win)
+            self._fac_psd = 1 / float(xp.sqrt(
+                xp.sum(self.win.real**2+self.win.imag**2) / self.T))
         return self._fac_psd
 
     @property
@@ -1838,7 +1882,10 @@ class ShortTimeFFT:
             return self._lower_border_end
 
         # first non-zero element in self.win:
-        m0 = np.flatnonzero(self.win.real**2 + self.win.imag**2)[0]
+        xp = array_namespace(self._win)
+        win_sq = self.win.real**2 + self.win.imag**2
+        nonzero_indices = xp.nonzero(win_sq)[0]
+        m0 = int(nonzero_indices[0])
 
         # move window to the right until does not stick out to the left:
         k0 = -self.m_num_mid + m0
@@ -2018,7 +2065,8 @@ class ShortTimeFFT:
             return last_return_value
 
         p0, p1 = self.p_range(n, p0, p1)
-        return_value = np.arange(p0, p1) * self.delta_t + k_offset * self.T
+        xp = array_namespace(self._win)
+        return_value = xp.arange(p0, p1) * self.delta_t + k_offset * self.T
 
         self._cache_t = args, return_value
         return return_value
@@ -2125,12 +2173,13 @@ class ShortTimeFFT:
         if current_state == last_state:  # use cached value:
             return last_return_value
 
+        xp = array_namespace(self._win)
         if self.fft_mode in {'onesided', 'onesided2X'}:
-            return_value = fft_lib.rfftfreq(self.mfft, self.T)
+            return_value = fft_lib.rfftfreq(self.mfft, self.T, xp=xp)
         elif self.fft_mode == 'twosided':
-            return_value = fft_lib.fftfreq(self.mfft, self.T)
+            return_value = fft_lib.fftfreq(self.mfft, self.T, xp=xp)
         elif self.fft_mode == 'centered':
-            return_value = fft_lib.fftshift(fft_lib.fftfreq(self.mfft, self.T))
+            return_value = fft_lib.fftshift(fft_lib.fftfreq(self.mfft, self.T, xp=xp))
         else:  # This should never happen but makes the Linters happy:
             fft_modes = get_args(FFT_MODE_TYPE)
             raise RuntimeError(f"{self.fft_mode=} not in {fft_modes}!")
@@ -2144,13 +2193,14 @@ class ShortTimeFFT:
         For multidimensional arrays the transformation is carried out on the
         last axis.
         """
+        xp = array_namespace(x)
         if self.phase_shift is not None:
             if x.shape[-1] < self.mfft:  # zero pad if needed
                 z_shape = list(x.shape)
                 z_shape[-1] = self.mfft - x.shape[-1]
-                x = np.hstack((x, np.zeros(z_shape, dtype=x.dtype)))
+                x = xp.concat((x, xp.zeros(z_shape, dtype=x.dtype)), axis=-1)
             p_s = (self.phase_shift + self.m_num_mid) % self.m_num
-            x = np.roll(x, -p_s, axis=-1)
+            x = xp.roll(x, -p_s, axis=-1)
 
         if self.fft_mode == 'twosided':
             return fft_lib.fft(x, n=self.mfft, axis=-1)
@@ -2161,9 +2211,10 @@ class ShortTimeFFT:
         if self.fft_mode == 'onesided2X':
             X = fft_lib.rfft(x, n=self.mfft, axis=-1)
             # Either squared magnitude (psd) or magnitude is doubled:
-            fac = np.sqrt(2) if self.scaling == 'psd' else 2
+            fac = math.sqrt(2) if self.scaling == 'psd' else 2
             # For even input length, the last entry is unpaired:
-            X[..., 1: -1 if self.mfft % 2 == 0 else None] *= fac
+            q1 = -1 if self.mfft % 2 == 0 else None
+            X = xpx.at(X, (..., slice(1, q1))).multiply(fac)
             return X
         # This should never happen but makes the Linter happy:
         fft_modes = get_args(FFT_MODE_TYPE)
@@ -2177,6 +2228,7 @@ class ShortTimeFFT:
         For multidimensional arrays the transformation is carried out on the
         last axis.
         """
+        xp = array_namespace(X)
         if self.fft_mode == 'twosided':
             x = fft_lib.ifft(X, n=self.mfft, axis=-1)
         elif self.fft_mode == 'centered':
@@ -2184,12 +2236,12 @@ class ShortTimeFFT:
         elif self.fft_mode == 'onesided':
             x = fft_lib.irfft(X, n=self.mfft, axis=-1)
         elif self.fft_mode == 'onesided2X':
-            Xc = X.copy()  # we do not want to modify function parameters
-            fac = np.sqrt(2) if self.scaling == 'psd' else 2
+            Xc = xp_copy(X, xp=xp)  # we do not want to modify function parameters
+            fac = math.sqrt(2) if self.scaling == 'psd' else 2
             # For even length X the last value is not paired with a negative
             # value on the two-sided FFT:
             q1 = -1 if self.mfft % 2 == 0 else None
-            Xc[..., 1:q1] /= fac
+            Xc = xpx.at(Xc, (..., slice(1, q1))).divide(fac)
             x = fft_lib.irfft(Xc, n=self.mfft, axis=-1)
         else:  # This should never happen but makes the Linter happy:
             raise RuntimeError(f"{self.fft_mode=} not in {get_args(FFT_MODE_TYPE)}!")
@@ -2197,7 +2249,7 @@ class ShortTimeFFT:
         if self.phase_shift is None:
             return x[..., :self.m_num]
         p_s = (self.phase_shift + self.m_num_mid) % self.m_num
-        return np.roll(x, p_s, axis=-1)[..., :self.m_num]
+        return xp.roll(x, p_s, axis=-1)[..., :self.m_num]
 
     def extent(self, n: int, axes_seq: Literal['tf', 'ft'] = 'tf',
                center_bins: bool = False) -> tuple[float, float, float, float]:
