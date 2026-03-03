@@ -16,6 +16,7 @@
 # Linter does not allow to import ``Generator`` from ``typing`` module:
 from collections.abc import Generator, Callable
 from functools import partial, cached_property
+import math
 from types import GenericAlias
 from typing import get_args, Literal
 
@@ -65,7 +66,7 @@ def _calc_dual_canonical_window(win: np.ndarray, hop: int) -> np.ndarray:
         DD = xpx.at(DD, slice(None, -k_)).add(w2[k_:])
 
     # check DD > 0:
-    relative_resolution = xp.finfo(win.dtype).resolution * float(xp.max(DD))
+    relative_resolution = xp.finfo(win.dtype).resolution * xp.max(DD)
     if not bool(xp.all(DD >= relative_resolution)):
         raise ValueError("Short-time Fourier Transform not invertible!")
 
@@ -225,8 +226,7 @@ def closest_STFT_dual_window(win: np.ndarray, hop: int,
     return w_d + alpha * (desired_dual - q_d), alpha
 
 
-def _pad_slice(x: np.ndarray, left_pad: int, right_pad: int,
-               mode: str, xp) -> np.ndarray:
+def _pad_slice(x, left_pad: int, right_pad: int, mode: str, xp):
     """Pad the last axis of `x` by `left_pad` and `right_pad` samples.
 
     This is a helper for `ShortTimeFFT._x_slices` that implements Array API
@@ -812,8 +812,8 @@ class ShortTimeFFT:
         win = xp_copy(desired_win, xp=xp)  # we do not want to modify input parameters
         relative_resolution = xp.finfo(win.dtype).resolution * float(xp.max(win))
         for m in range(hop):
-            a = float(xp.sqrt(xp.sum(desired_win[m::hop]**2)))
-            if not (a > relative_resolution):
+            a = xp.sqrt(xp.sum(desired_win[m::hop]**2))
+            if not bool(a > relative_resolution):
                 raise ValueError("Parameter desired_win does not have valid STFT dual "
                                  f"window for {hop=}!")
             win = xpx.at(win, slice(m, None, hop)).set(win[m::hop] / a)
@@ -2211,7 +2211,7 @@ class ShortTimeFFT:
         if self.fft_mode == 'onesided2X':
             X = fft_lib.rfft(x, n=self.mfft, axis=-1)
             # Either squared magnitude (psd) or magnitude is doubled:
-            fac = float(xp.sqrt(xp.asarray(2., dtype=xp.float64))) if self.scaling == 'psd' else 2
+            fac = math.sqrt(2) if self.scaling == 'psd' else 2
             # For even input length, the last entry is unpaired:
             q1 = -1 if self.mfft % 2 == 0 else None
             X = xpx.at(X, (..., slice(1, q1))).multiply(fac)
@@ -2237,7 +2237,7 @@ class ShortTimeFFT:
             x = fft_lib.irfft(X, n=self.mfft, axis=-1)
         elif self.fft_mode == 'onesided2X':
             Xc = xp_copy(X, xp=xp)  # we do not want to modify function parameters
-            fac = float(xp.sqrt(xp.asarray(2., dtype=xp.float64))) if self.scaling == 'psd' else 2
+            fac = math.sqrt(2) if self.scaling == 'psd' else 2
             # For even length X the last value is not paired with a negative
             # value on the two-sided FFT:
             q1 = -1 if self.mfft % 2 == 0 else None
