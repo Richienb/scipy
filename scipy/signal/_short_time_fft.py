@@ -812,7 +812,7 @@ class ShortTimeFFT:
         win = xp_copy(desired_win, xp=xp)  # we do not want to modify input parameters
         relative_resolution = xp.finfo(win.dtype).resolution * float(xp.max(win))
         for m in range(hop):
-            a = xp.sqrt(xp.sum(desired_win[m::hop]**2))
+            a = xp.linalg.vector_norm(desired_win[m::hop])
             if not bool(a > relative_resolution):
                 raise ValueError("Parameter desired_win does not have valid STFT dual "
                                  f"window for {hop=}!")
